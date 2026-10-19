@@ -1,0 +1,124 @@
+# 逻辑模型 → 物理端点映射
+#
+# 业务代码只传逻辑名（chat-lite / chat-pro / vision），
+# 真实供应商、端点、模型名、超时、能力声明都在这里。
+# 密钥不写在这里：只写 api_key_env，运行时从环境变量取。
+#
+# 切换模型时：改本文文件 → 调 /admin/config/reload（快照校验通过才生效）。
+
+default_provider: openai_compat
+
+models:
+  chat-lite:
+    provider: openai_compat
+    base_url: ${ARK_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+    model: doubao-lite-32k
+    api_key_env: ARK_API_KEY
+    timeout_s: 15
+    max_output_tokens: 1024
+    temperature: 0.3
+    capabilities: [tools, stream]
+    cost_per_1k_input: 0.0008
+    cost_per_1k_output: 0.002
+
+  chat-pro:
+    provider: openai_compat
+    base_url: ${ARK_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+    model: doubao-pro-32k
+    api_key_env: ARK_API_KEY
+    timeout_s: 30
+    max_output_tokens: 2048
+    temperature: 0.3
+    capabilities: [tools, stream, json_mode]
+    cost_per_1k_input: 0.0016
+    cost_per_1k_output: 0.004
+
+  vision:
+    provider: openai_compat
+    base_url: ${ARK_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+    model: doubao-vision-pro
+    api_key_env: ARK_API_KEY
+    timeout_s: 40
+    max_output_tokens: 1024
+    capabilities: [vision]
+    cost_per_1k_input: 0.002
+    cost_per_1k_output: 0.005
+
+  chat-lite-mock:
+    provider: mock
+    model: mock-fast
+    timeout_s: 5
+    capabilities: [tools, stream]
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+
+# 路由规则：按任务类型挑模型（不是所有请求都走最贵的模型）
+routing:
+  default: chat-lite
+  overrides:
+    product_consulting: chat-pro
+    complex_reasoning: chat-pro
+    image_understanding: vision
+
+# ---- 桥接层：项目级 API Key（演示数据，生产应入库并支持轮换）----
+# key 明文仅用于本地演示；生产用哈希存储 + 前缀索引。
+# `service` 是权限链第一级（Service → Agent → Tool → Resource）：一条业务线可能挂多个 project，
+# 按 service 维度做限流与成本聚合，才能回答「哪条线在花钱」。未声明时退化为 project_id。
+api_keys:
+  - key: sk-project-service-demo
+    api_key_id: key_service_bot
+    project_id: cs-bot
+    service: cs-service
+    scopes: ["tools:read", "tools:knowledge", "llm:chat", "memory:rw"]
+    requests_per_window: 600
+    tokens_per_window: 200000
+  - key: sk-project-sales-demo
+    api_key_id: key_sales_agent
+    project_id: sales-agent
+    service: sales-ops
+    scopes: ["tools:read", "tools:write", "llm:chat", "memory:rw"]
+    requests_per_window: 300
+    tokens_per_window: 100000
+  - key: sk-project-content-demo
+    api_key_id: key_content_ops
+    project_id: content-ops
+    service: content-ops
+    scopes: ["llm:chat", "data:rw"]
+    requests_per_window: 100
+    tokens_per_window: 50000
+  # 新增能力只能另加 key：评测与 Prompt 预览属于平台治理能力，
+  # 给独立凭证而不是扩大业务线的 scope，避免「客服的 key 能看全公司成本」这类越权面。
+  - key: sk-project-eval-demo
+    api_key_id: key_eval_runner
+    project_id: ai-eval
+    service: ai-platform
+    scopes: ["llm:chat", "eval:rw", "prompt:rw"]
+    requests_per_window: 200
+    tokens_per_window: 100000
+  # 宿主业务后端的运营侧凭证：/v1/admin/* 需要 commerce:rw。
+  # 同样另加 key 而不是给既有业务线加 scope —— 客服/销售的 key 不该能上架商品或改库存。
+  - key: sk-project-shopadmin-demo
+    api_key_id: key_shop_admin
+    project_id: shop-admin
+    service: shop-ops
+    scopes: ["commerce:rw", "tools:read"]
+    requests_per_window: 300
+    tokens_per_window: 100000
+  # 项目一的 HITL 审批凭证：确认高风险动作是**独立权限**（hitl:approve），
+  # 客服线的 key 不能自己批自己的单 —— 否则「人工确认」这道闸门等于不存在。
+  - key: sk-project-hitl-demo
+    api_key_id: key_hitl_approver
+    project_id: cs-ops
+    service: cs-ops
+    scopes: ["llm:chat", "tools:read", "tools:knowledge", "tools:write", "memory:rw", "hitl:approve"]
+    requests_per_window: 200
+    tokens_per_window: 100000
+  # 项目二的运营系统凭证：内容生产、多模态素材写入、直播处理、自进化迭代都是数据面写操作，
+  # 统一收敛到独立 scope ops:rw —— 内容运营线的 key 不该能触发直播切片或变更模板版本。
+  - key: sk-project-ops-demo
+    api_key_id: key_ops_runner
+    project_id: ops-content
+    service: ops-service
+    scopes: ["llm:chat", "tools:knowledge", "ops:rw"]
+    requests_per_window: 200
+    tokens_per_window: 120000

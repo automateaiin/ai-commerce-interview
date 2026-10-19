@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LUMIÈRE · 电商运营台</title>
+<link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+
+<div class="shell">
+  <aside class="aside">
+    <div class="logo">LUMIÈRE<small>OPS CONSOLE</small></div>
+    <div class="nav-sep">电商业务</div>
+    <button class="nav-item active" data-tab="overview">◎ 运营概览</button>
+    <button class="nav-item" data-tab="orders">▤ 订单与物流</button>
+    <button class="nav-item" data-tab="products">▣ 商品上下架</button>
+    <button class="nav-item" data-tab="stock">◫ 库存管理</button>
+    <button class="nav-item" data-tab="coupons">◎ 优惠券</button>
+    <div class="nav-sep">AI 能力</div>
+    <button class="nav-item" data-tab="ops">✦ AI 运营工作流</button>
+    <button class="nav-item" data-tab="cost">✦ AI 成本与治理</button>
+    <div class="nav-sep">平台</div>
+    <button class="nav-item" data-tab="auth">⚿ 凭证与权限</button>
+  </aside>
+
+  <main class="main">
+    <div class="page-head row between wrap-row" style="gap:14px;">
+      <div>
+        <div class="eyebrow">BEAUTY COMMERCE OPERATIONS</div>
+        <h1 style="margin-top:6px;font-size:26px;" id="pageTitle">运营概览</h1>
+      </div>
+      <div class="card" style="padding:10px 14px;display:flex;gap:14px;align-items:center;">
+        <div class="field" style="gap:3px;">
+          <label>当前运营凭证（X-API-Key）</label>
+          <select class="select" id="keySelect" style="width:280px"></select>
+        </div>
+        <div class="col" style="gap:3px;">
+          <span class="tag">scope</span>
+          <div class="row wrap-row" id="scopeList" style="gap:5px;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-overview" class="tab"></div>
+    <div id="tab-orders" class="tab hidden"></div>
+    <div id="tab-products" class="tab hidden"></div>
+    <div id="tab-stock" class="tab hidden"></div>
+    <div id="tab-coupons" class="tab hidden"></div>
+    <div id="tab-ops" class="tab hidden"></div>
+    <div id="tab-cost" class="tab hidden"></div>
+    <div id="tab-auth" class="tab hidden"></div>
+  </main>
+</div>
+
+<script src="/assets/app.js"></script>
+<script>
+// ============================================================================
+// 运营台逻辑。三条与后端一致的口径：
+//   1) /v1/admin/* 要 commerce:rw，/v1/ops/* 要 ops:rw —— 两条业务线凭证不通用；
+//   2) 平台治理接口（cost/quota/audit/prompts）只需「任意有效凭证」，但数据按
+//      project_id/service 前缀隔离，所以换凭证后看到的成本口径会不同；
+//   3) 每个面板都提供「原始响应」折叠块 —— 演示页的价值是让契约可见，
+//      而不是替后端把数据美化一遍（美化后反而掩盖了真实字段）。
+// ============================================================================
+
+const KEYS = [
+  { id: "sk-project-shopadmin-demo", label: "运营后台（shop-ops）", scopes: ["commerce:rw", "tools:read"] },
+  { id: "sk-project-ops-demo", label: "内容运营线（ops-service）", scopes: ["llm:chat", "tools:knowledge", "ops:rw"] },
+  { id: "sk-project-eval-demo", label: "平台评测（ai-platform）", scopes: ["llm:chat", "eval:rw", "prompt:rw"] },
+  { id: "sk-project-service-demo", label: "客服线（cs-service）", scopes: ["tools:read", "tools:knowledge", "llm:chat", "memory:rw"] },
+  { id: "sk-project-content-demo", label: "数据平台（content-ops）", scopes: ["llm:chat", "data:rw"] },
+  { id: "sk-project-hitl-demo", label: "人工审批（cs-ops）", scopes: ["llm:chat", "tools:read", "tools:write", "hitl:approve"] },
+  { id: "", label: "（不带凭证）演示 401", scopes: [] },
+];
+
+const currentKey = () => KEYS.find((k) => k.id === Store.adminKey.get()) || KEYS[0];
+
+/** 带 scope 断言的调用：缺 scope 时给出「该切哪把钥匙」的明确提示，而不是只抛 403。 */
+async function call(path, opts = {}, needScope = null) {
+  const key = currentKey();
+  if (needScope && !key.scopes.includes(needScope)) {
+    const hint = KEYS.find((k) => k.scopes.includes(needScope));
+    throw new Error(`[forbidden_scope] 当前凭证缺少 ${needScope}${hint ? `，请切换到「${hint.label}」` : ""}`);
+  }
+  return api(path, { ...opts, key: key.id });
+}
+
+// ---------- Tab 切换 ----------
+const RENDERERS = {};
+function showTab(name) {
+  document.querySelectorAll(".nav-item").forEach((el) => el.classList.toggle("active", el.dataset.tab === name));
+  document.querySelectorAll(".tab").forEach((el) => el.classList.toggle("hidden", el.id !== `tab-${name}`));
+  const labels = { overview: "运营概览", orders: "订单与物流", products: "商品上下架", stock: "库存管理", coupons: "优惠券", ops: "AI 运营工作流", cost: "AI 成本与治理", auth: "凭证与权限" };
+  document.getElementById("pageTitle").textContent = labels[name] || name;
+  if (RENDERERS[name]) RENDERERS[name]();
+}
+document.querySelectorAll(".nav-item").forEach((el) => (el.onclick = () => showTab(el.dataset.tab)));
+
+function loading(tab, text = "加载中…") {
+  document.getElementById(`tab-${tab}`).innerHTML = `<div class="empty"><span class="spinner"></span> ${esc(text)}</div>`;
+}
+
+// ============================================================================
+// 概览
+// ============================================================================
+RENDERERS.overview = async function () {
+  loading("overview");
+  const el = document.getElementById("tab-overview");
+  try {
+    const [stats, low, cost] = await Promise.all([
+      call("/v1/admin/orders/stats?days=7", {}, "commerce:rw"),
+      call("/v1/admin/stock/low", {}, "commerce:rw"),
+      call("/v1/cost").catch(() => null),
+    ]);
+    const s = stats.stats || {};
+    const by = s.by_status || {};
+    const total = Object.values(by).reduce((n, v) => n + v, 0) || 1;
+    el.innerHTML = `
+      <div class="grid p4 section">
+        <div class="kpi"><div class="label">近 7 天有效订单</div><div class="value">${fmt.num(s.orders)} <small>单</small></div></div>
+        <div class="kpi"><div class="label">近 7 天 GMV</div><div class="value">${fmt.cents(s.gmv_cents)}</div></div>
+        <div class="kpi"><div class="label">待发货</div><div class="value">${fmt.num(by.PAID || 0)} <small>单</small></div></div>
+        <div class="kpi"><div class="label">低库存 SKU</div><div class="value">${fmt.num(low.count)} <small>个</small></div></div>
+      </div>
+      <div class="grid p2">
+        <div class="card">
+          <div class="card-head"><h3>订单状态分布</h3><span class="tag">since ${fmt.time(stats.since)}</span></div>
+          <div class="card-body col">
+            ${Object.entries(by).map(([k, v]) => `
+              <div>
+                <div class="row between"><span style="font-size:12.5px;">${orderBadge(k)}</span><span class="tag">${v} 单 · ${((v / total) * 100).toFixed(0)}%</span></div>
+                <div class="bar" style="margin-top:5px;"><i style="width:${(v / total) * 100}%"></i></div>
+              </div>`).join("") || "<div class='empty'>暂无数据</div>"}
+            <div class="tag" style="margin-top:6px;">口径：GMV 只统计未取消订单的应付金额；取消单不计入营收。</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>平台成本水位</h3><span class="tag">/v1/cost</span></div>
+          <div class="card-body col">
+            ${cost ? `
+              <div class="grid p2">
+                <div class="kpi"><div class="label">累计调用</div><div class="value">${fmt.num(cost.totals.calls)}</div></div>
+                <div class="kpi"><div class="label">累计 Token</div><div class="value">${fmt.num(cost.totals.total_tokens)}</div></div>
+              </div>
+              <div>
+                <div class="row between"><span class="tag">预算水位（${esc(cost.budget.scope)}）</span><span class="tag">${fmt.num(cost.budget.used_tokens)} / ${fmt.num(cost.budget.limit_tokens)}</span></div>
+                <div class="bar" style="margin-top:5px;"><i style="width:${Math.min(100, (cost.budget.ratio || 0) * 100)}%"></i></div>
+              </div>
+              <div class="row between"><span class="tag">成本后端</span><span class="badge">${esc(cost.backends.budget)} / ${esc(cost.backends.ratelimit)}</span></div>
+            ` : "<div class='empty'>成本接口不可用</div>"}
+            <div class="row"><button class="btn sm" data-goto="cost">查看成本明细</button><button class="btn sm" data-goto="orders">处理订单</button></div>
+          </div>
+        </div>
+      </div>`;
+    el.querySelectorAll("[data-goto]").forEach((b) => (b.onclick = () => showTab(b.dataset.goto)));
+  } catch (err) {
+    el.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`;
+  }
+};
+
+// ============================================================================
+// 订单与物流
+// ============================================================================
+RENDERERS.orders = async function () {
+  const el = document.getElementById("tab-orders");
+  el.innerHTML = `
+    <div class="card section">
+      <div class="card-head">
+        <h3>订单列表（跨会员，运营视角）</h3>
+        <div class="row">
+          <select class="select" id="orderStatus" style="width:150px">
+            <option value="">全部状态</option>
+            <option value="PENDING_PAYMENT">待付款</option>
+            <option value="PAID">已付款（待发货）</option>
+            <option value="SHIPPED">已发货</option>
+            <option value="COMPLETED">已完成</option>
+            <option value="CANCELLED">已取消</option>
+          </select>
+          <input class="input" id="shipCarrier" value="DHL" style="width:110px" placeholder="承运商" />
+          <button class="btn sm" id="btnSweep">清理超时未付款</button>
+          <button class="btn sm" id="btnReloadOrders">刷新</button>
+        </div>
+      </div>
+      <div class="card-body" id="ordersList"><div class="empty"><span class="spinner"></span></div></div>
+    </div>`;
+
+  const list = document.getElementById("ordersList");
+  const load = async () => {
+    list.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+    try {
+      const status = document.getElementById("orderStatus").value;
+      const data = await call(`/v1/admin/orders${status ? "?status=" + status : ""}`, {}, "commerce:rw");
+      const orders = data.items || [];
+      if (!orders.length) { list.innerHTML = `<div class="empty">没有符合条件的订单。</div>`; return; }
+      list.innerHTML = `
+        <table class="table"><thead><tr>
+          <th>订单号</th><th>状态</th><th>会员</th><th>商品</th><th>应付</th><th>承运商</th><th>创建时间</th><th>操作</th>
+        </tr></thead><tbody>
+        ${orders.map((o) => `<tr>
+          <td class="mono">${esc(o.order_id)}</td>
+          <td>${orderBadge(o.status)}</td>
+          <td class="mono">${esc(o.member_id)}</td>
+          <td style="max-width:280px;">${(o.items || []).map((i) => `${esc(i.name)} × ${i.quantity}`).join("、")}</td>
+          <td>${fmt.usd(o.payable_usd)}</td>
+          <td>${esc(o.carrier || "—")}</td>
+          <td class="tag">${fmt.time(o.created_at)}</td>
+          <td>${o.status === "PAID" ? `<button class="btn sm primary" data-ship="${esc(o.order_id)}">发货</button>` : `<span class="tag">—</span>`}</td>
+        </tr>`).join("")}
+        </tbody></table>
+        <div class="tag" style="margin-top:10px;">只有 PAID 状态可发货：状态机由领域层把关，前端不重复判断规则。</div>`;
+      list.querySelectorAll("[data-ship]").forEach((b) => (b.onclick = async () => {
+        const carrier = document.getElementById("shipCarrier").value.trim() || "DHL";
+        try {
+          await call(`/v1/admin/orders/${encodeURIComponent(b.dataset.ship)}/ship?carrier=${encodeURIComponent(carrier)}`, { method: "POST" }, "commerce:rw");
+          toast(`已发货：${carrier}`, "ok");
+          load();
+        } catch (err) { toast(describeError(err), "err"); }
+      }));
+    } catch (err) {
+      list.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`;
+    }
+  };
+  document.getElementById("btnReloadOrders").onclick = load;
+  document.getElementById("orderStatus").onchange = load;
+  document.getElementById("btnSweep").onclick = async () => {
+    try { const r = await call("/v1/admin/orders/sweep", { method: "POST" }, "commerce:rw"); toast(`已清理 ${r.cancelled} 笔超时订单`, "ok"); load(); }
+    catch (err) { toast(describeError(err), "err"); }
+  };
+  load();
+};
+
+// ============================================================================
+// 商品上下架
+// ============================================================================
+RENDERERS.products = async function () {
+  const el = document.getElementById("tab-products");
+  el.innerHTML = `
+    <div class="card section">
+      <div class="card-head">
+        <h3>商品列表（全状态）</h3>
+        <div class="row">
+          <input class="input" id="prodKeyword" placeholder="搜索名称 / 品牌" style="width:190px" />
+          <select class="select" id="prodStatus" style="width:140px">
+            <option value="">全部状态</option><option value="ON_SALE">在售</option>
+            <option value="OFF_SHELF">已下架</option><option value="DRAFT">草稿</option>
+          </select>
+          <button class="btn sm" id="btnProdSearch">查询</button>
+        </div>
+      </div>
+      <div class="card-body" id="prodList"><div class="empty"><span class="spinner"></span></div></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>浏览侧对照</h3><span class="tag">/v1/shop/products（无凭证）</span></div>
+      <div class="card-body">
+        <p class="muted" style="font-size:13px;">买家侧只能看到 <b>ON_SALE</b> 的商品，且未上架商品在详情接口按 404 处理。
+        下面这张表是同一批数据在买家侧的样子 —— 上架/下架后两边会立刻分叉，这正是「内容不外泄」的验证方式。</p>
+        <div id="publicList" style="margin-top:14px;"><div class="empty"><span class="spinner"></span></div></div>
+      </div>
+    </div>`;
+
+  const load = async () => {
+    const list = document.getElementById("prodList");
+    list.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+    try {
+      const params = new URLSearchParams(compact({
+        keyword: document.getElementById("prodKeyword").value.trim(),
+        status: document.getElementById("prodStatus").value,
+      })).toString();
+      const data = await call(`/v1/admin/products${params ? "?" + params : ""}`, {}, "commerce:rw");
+      const items = data.items || [];
+      list.innerHTML = items.length ? `<table class="table"><thead><tr>
+        <th>商品</th><th>品类</th><th>价格</th><th>SKU</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody>
+        ${items.map((p) => `<tr>
+          <td><div style="font-weight:600;">${esc(p.name)}</div><div class="tag">${esc(p.product_id)} · ${esc(p.brand)}</div></td>
+          <td><span class="badge">${esc(p.category)}</span></td>
+          <td>${fmt.usd(p.price_usd)}</td>
+          <td class="mono tag">${(p.skus || []).map((s) => esc(s.sku_id)).join(", ")}</td>
+          <td>${statusBadge(p)}</td>
+          <td class="row" style="gap:6px;">
+            ${p.status === "ON_SALE"
+              ? `<button class="btn sm" data-unpub="${esc(p.product_id)}">下架</button>`
+              : `<button class="btn sm brand" data-pub="${esc(p.product_id)}">上架</button>`}
+          </td>
+        </tr>`).join("")}
+      </tbody></table>` : `<div class="empty">没有商品。</div>`;
+
+      list.querySelectorAll("[data-pub]").forEach((b) => (b.onclick = async () => {
+        try { await call(`/v1/admin/products/${encodeURIComponent(b.dataset.pub)}/publish`, { method: "POST" }, "commerce:rw"); toast("已上架", "ok"); load(); loadPublic(); }
+        catch (err) { toast(describeError(err), "err"); }
+      }));
+      list.querySelectorAll("[data-unpub]").forEach((b) => (b.onclick = async () => {
+        try { await call(`/v1/admin/products/${encodeURIComponent(b.dataset.unpub)}/unpublish`, { method: "POST" }, "commerce:rw"); toast("已下架", "ok"); load(); loadPublic(); }
+        catch (err) { toast(describeError(err), "err"); }
+      }));
+    } catch (err) { list.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`; }
+  };
+
+  const loadPublic = async () => {
+    const box = document.getElementById("publicList");
+    try {
+      const data = await api("/v1/shop/products", { token: "" });
+      box.innerHTML = `<div class="row wrap-row" style="gap:8px;">${(data.items || []).map((p) => `<span class="chip">${esc(p.name)} · ${fmt.usd(p.price_usd)}</span>`).join("") || "<span class='tag'>买家侧看不到任何在售商品</span>"}</div>`;
+    } catch (err) { box.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`; }
+  };
+
+  document.getElementById("btnProdSearch").onclick = load;
+  document.getElementById("prodKeyword").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+  document.getElementById("prodStatus").onchange = load;
+  load();
+  loadPublic();
+};
+
+// ============================================================================
+// 库存
+// ============================================================================
+RENDERERS.stock = async function () {
+  const el = document.getElementById("tab-stock");
+  el.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>低库存预警</h3><div class="row"><button class="btn sm" id="btnLowReload">刷新</button></div></div>
+      <div class="card-body" id="lowList"><div class="empty"><span class="spinner"></span></div></div>
+    </div>`;
+
+  const load = async () => {
+    const list = document.getElementById("lowList");
+    list.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+    try {
+      const data = await call("/v1/admin/stock/low", {}, "commerce:rw");
+      const items = data.items || [];
+      if (!items.length) { list.innerHTML = `<div class="empty">没有触及预警线的 SKU。</div>`; return; }
+      list.innerHTML = `<table class="table"><thead><tr><th>SKU</th><th>可售</th><th>预警线</th><th>补货（绝对值）</th><th></th></tr></thead><tbody>
+        ${items.map((s) => `<tr>
+          <td class="mono">${esc(s.sku_id)}</td>
+          <td><span class="badge ${s.available <= 0 ? "err" : "warn"}">${s.available}</span></td>
+          <td class="tag">${s.threshold}</td>
+          <td><input class="input" type="number" min="0" value="${s.available + 50}" data-stock-input="${esc(s.sku_id)}" style="width:110px" /></td>
+          <td><button class="btn sm primary" data-adjust="${esc(s.sku_id)}">设为该值</td>
+        </tr>`).join("")}
+      </tbody></table>
+      <div class="tag" style="margin-top:10px;">接口设的是<b>绝对值</b>而不是增量：增量在「补货同时有人下单」时会算错基准，绝对值可复核。</div>`;
+      list.querySelectorAll("[data-adjust]").forEach((b) => (b.onclick = async () => {
+        const input = list.querySelector(`[data-stock-input="${b.dataset.adjust}"]`);
+        try {
+          await call("/v1/admin/stock/adjust", { method: "POST", body: { sku_id: b.dataset.adjust, available: Number(input.value) } }, "commerce:rw");
+          toast("库存已更新", "ok"); load();
+        } catch (err) { toast(describeError(err), "err"); }
+      }));
+    } catch (err) { list.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`; }
+  };
+  document.getElementById("btnLowReload").onclick = load;
+  load();
+};
+
+// ============================================================================
+// 优惠券
+// ============================================================================
+RENDERERS.coupons = async function () {
+  const el = document.getElementById("tab-coupons");
+  el.innerHTML = `
+    <div class="grid p2 section">
+      <div class="card">
+        <div class="card-head"><h3>新建券模板</h3><span class="tag">POST /v1/admin/coupons/templates</span></div>
+        <div class="card-body col">
+          <div class="field"><label>名称</label><input class="input" id="cpName" value="秋季会员礼遇" /></div>
+          <div class="grid p2">
+            <div class="field"><label>类型</label><select class="select" id="cpKind"><option value="FULL_REDUCTION">满减券</option><option value="PERCENT">折扣券</option></select></div>
+            <div class="field"><label>门槛（美元）</label><input class="input" id="cpThreshold" type="number" value="100" /></div>
+          </div>
+          <div class="grid p2">
+            <div class="field"><label>面值（分 / 折扣基点）</label><input class="input" id="cpValue" type="number" value="1500" /></div>
+            <div class="field"><label>发放总量（0=不限）</label><input class="input" id="cpTotal" type="number" value="0" /></div>
+          </div>
+          <div class="field"><label>每人限领</label><input class="input" id="cpPer" type="number" value="1" /></div>
+          <div class="tag">折扣券的 value_cents 是<b>基点</b>：1000 = 9 折。满减券是减免金额（分）。</div>
+          <button class="btn primary" id="btnCreateCoupon">创建模板</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>现有模板</h3><span class="tag">买家侧可见</span></div>
+        <div class="card-body" id="cpList"><div class="empty"><span class="spinner"></span></div></div>
+      </div>
+    </div>`;
+
+  const load = async () => {
+    const box = document.getElementById("cpList");
+    try {
+      const data = await api("/v1/shop/coupons/templates", { token: "" });
+      const items = data.items || [];
+      box.innerHTML = items.length ? `<div class="col">${items.map((t) => `
+        <div class="panel row between">
+          <div class="col" style="gap:2px;">
+            <div style="font-weight:600;">${esc(t.name)}</div>
+            <div class="tag">${t.kind === "PERCENT" ? `${(Number(t.value_cents) / 100).toFixed(0)}% 折扣` : `立减 ${fmt.cents(t.value_cents)}`} · 门槛 ${fmt.usd(t.threshold_usd)} · 限领 ${t.per_member_limit}</div>
+          </div>
+          <span class="badge brand">${esc(t.kind)}</span>
+        </div>`).join("")}</div>` : `<div class="empty">还没有券模板。</div>`;
+    } catch (err) { box.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`; }
+  };
+  document.getElementById("btnCreateCoupon").onclick = async () => {
+    try {
+      const body = {
+        name: document.getElementById("cpName").value,
+        kind: document.getElementById("cpKind").value,
+        threshold_usd: Number(document.getElementById("cpThreshold").value),
+        value_cents: Number(document.getElementById("cpValue").value),
+        total: Number(document.getElementById("cpTotal").value),
+        per_member_limit: Number(document.getElementById("cpPer").value),
+        stackable: false,
+      };
+      const r = await call("/v1/admin/coupons/templates", { method: "POST", body }, "commerce:rw");
+      toast(`已创建：${r.template.name}`, "ok");
+      load();
+    } catch (err) { toast(describeError(err), "err"); }
+  };
+  load();
+};
+
+// ============================================================================
+// AI 运营工作流（项目二）
+// ============================================================================
+RENDERERS.ops = async function () {
+  const el = document.getElementById("tab-ops");
+  el.innerHTML = `
+    <div class="card section">
+      <div class="card-head"><h3>内容生产工作流</h3><span class="tag">POST /v1/ops/content/run（scope: ops:rw）</span></div>
+      <div class="card-body col">
+        <div class="grid p3">
+          <div class="field"><label>商品 ID</label><input class="input" id="opProductId" value="SKU-1001" /></div>
+          <div class="field"><label>商品名</label><input class="input" id="opProductName" value="雪绒花修护精华 30ml" /></div>
+          <div class="field"><label>站点</label><input class="input" id="opMarket" value="US" /></div>
+        </div>
+        <div class="grid p3">
+          <div class="field"><label>人群</label><input class="input" id="opAudience" value="敏感肌人群" /></div>
+          <div class="field"><label>渠道</label><input class="input" id="opChannel" value="social" /></div>
+          <div class="field"><label>语气</label><input class="input" id="opTone" value="专业亲和" /></div>
+        </div>
+        <div class="field"><label>关键词（逗号分隔）</label><input class="input" id="opKeywords" value="修护,屏障,低刺激" /></div>
+        <div class="row wrap-row">
+          <button class="btn primary" id="btnRunContent">跑一次工作流</button>
+          <button class="btn" id="btnStreamContent">SSE 流式跑一次</button>
+          <button class="btn" id="btnReplay">回放上一次 run</button>
+          <span class="tag">节点：选题 → 成分卖点 → (文案 ‖ 产品图)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card section" id="opsResultCard">
+      <div class="card-head"><h3>运行结果</h3><span class="tag" id="opsRunId">—</span></div>
+      <div class="card-body" id="opsResult"><div class="empty">尚未运行。</div></div>
+    </div>
+
+    <div class="card section">
+      <div class="card-head"><h3>SSE 事件流</h3><span class="tag">唯一流式端点 · text/event-stream</span></div>
+      <div class="card-body"><pre class="json" id="opsStream" style="max-height:260px;">待运行…</pre></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>更多运营能力</h3><span class="tag">并行基准 / 多模态检索 / 归因分析 / 自进化</span></div>
+      <div class="card-body col">
+        <div class="row wrap-row">
+          <button class="btn sm" id="btnBenchmark">并行基准测试</button>
+          <button class="btn sm" id="btnSelfEvolve">自进化报告</button>
+          <button class="btn sm" id="btnAnalytics">归因分析</button>
+        </div>
+        <div class="row">
+          <input class="input" id="assetQuery" value="烟酰胺" style="width:220px" />
+          <button class="btn sm" id="btnAssetSearch">跨模态检索</button>
+        </div>
+        <div id="opsExtra"></div>
+      </div>
+    </div>`;
+
+  const brief = () => ({
+    product_id: document.getElementById("opProductId").value.trim(),
+    product_name: document.getElementById("opProductName").value.trim(),
+    market: document.getElementById("opMarket").value.trim(),
+    audience: document.getElementById("opAudience").value.trim(),
+    channel: document.getElementById("opChannel").value.trim(),
+    tone: document.getElementById("opTone").value.trim(),
+    keywords: document.getElementById("opKeywords").value.split(",").map((s) => s.trim()).filter(Boolean),
+  });
+
+  const renderRun = (res) => {
+    document.getElementById("opsRunId").textContent = res.run_id || "—";
+    const records = res.records || [];
+    const artifacts = res.artifacts || {};
+    const usage = artifacts.usage || {};
+    document.getElementById("opsResult").innerHTML = `
+      <div class="grid p4 section">
+        <div class="kpi"><div class="label">状态</div><div class="value" style="font-size:18px;">${esc(res.status)}</div></div>
+        <div class="kpi"><div class="label">完成节点</div><div class="value">${(res.resolved || []).length} <small>/${records.length}</small></div></div>
+        <div class="kpi"><div class="label">耗时</div><div class="value">${Math.round(res.duration_ms || 0)} <small>ms</small></div></div>
+        <div class="kpi"><div class="label">Token</div><div class="value">${fmt.num(usage.total_tokens || 0)}</div></div>
+      </div>
+      <div class="theme-timeline col" style="gap:8px;">
+        ${records.map((r) => `
+          <div class="panel row between">
+            <div class="col" style="gap:3px;">
+              <div class="row"><b style="font-size:13px;">${esc(r.node)}</b>
+                <span class="badge ${r.status === "succeeded" ? "ok" : r.status === "failed" ? "err" : ""}">${esc(r.status)}</span>
+                ${r.logical_model ? `<span class="tag">模型 ${esc(r.logical_model)}</span>` : ""}
+              </div>
+              <div class="steps">${(r.attempts || []).map((a) => `<span class="step-dot ${a.status === "succeeded" ? "ok" : "err"}">第${a.attempt}次 ${a.status}${a.duration_ms ? ` · ${Math.round(a.duration_ms)}ms` : ""}</span>`).join("")}</div>
+              ${r.error ? `<div class="tag" style="color:var(--err)">${esc(r.error)}</div>` : ""}
+            </div>
+            <span class="tag">${Math.round(r.duration_ms || 0)}ms</span>
+          </div>`).join("")}
+      </div>
+      ${artifacts.copy ? `<div class="section">
+        <h3 style="margin-bottom:8px;">生成文案</h3>
+        <div class="card pad">
+          <div style="font-weight:600;font-size:15px;">${esc(artifacts.copy.headline)}</div>
+          <p style="margin:8px 0;white-space:pre-wrap;font-size:13.5px;">${esc(artifacts.copy.body)}</p>
+          <div class="row wrap-row" style="gap:6px;">${(artifacts.copy.hashtags || []).map((h) => `<span class="badge brand">${esc(h)}</span>`).join("")}</div>
+          ${artifacts.copy.cta ? `<div class="tag" style="margin-top:8px;">CTA：${esc(artifacts.copy.cta)}</div>` : ""}
+        </div>
+      </div>` : ""}
+      ${artifacts.image_brief ? `<div class="section">
+        <h3 style="margin-bottom:8px;">产品图提示词</h3>
+        <div class="card pad col" style="gap:6px;">
+          <div class="tag">aspect：${esc(artifacts.image_brief.aspect)}</div>
+          <div style="font-size:13px;">${esc(artifacts.image_brief.prompt)}</div>
+          ${artifacts.image_brief.negative ? `<div class="tag">negative：${esc(artifacts.image_brief.negative)}</div>` : ""}
+        </div>
+      </div>` : ""}
+      ${jsonBlock("原始响应（/v1/ops/content/run）", res)}`;
+  };
+
+  document.getElementById("btnRunContent").onclick = async () => {
+    const box = document.getElementById("opsResult");
+    box.innerHTML = `<div class="empty"><span class="spinner"></span> 正在跑工作流…</div>`;
+    try {
+      const res = await call("/v1/ops/content/run", { method: "POST", body: { brief: brief() } }, "ops:rw");
+      renderRun(res);
+      toast("工作流完成", "ok");
+    } catch (err) { box.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`; }
+  };
+
+  document.getElementById("btnReplay").onclick = async () => {
+    const runId = document.getElementById("opsRunId").textContent.trim();
+    const box = document.getElementById("opsResult");
+    if (!runId || runId === "—") { toast("先跑一次工作流", "err"); return; }
+    try {
+      const res = await call(`/v1/ops/workflow/${encodeURIComponent(runId)}`, {}, "ops:rw");
+      box.innerHTML = `<h3 style="margin-bottom:8px;">回放时间线（${esc(runId)}）</h3>` +
+        `<pre class="json">${esc(JSON.stringify(res.replay, null, 2))}</pre>` + jsonBlock("原始快照", res);
+    } catch (err) { toast(describeError(err), "err"); }
+  };
+
+  document.getElementById("btnStreamContent").onclick = async () => {
+    const pre = document.getElementById("opsStream");
+    pre.textContent = "";
+    try {
+      const res = await fetch("/v1/ops/content/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": currentKey().id },
+        body: JSON.stringify({ brief: brief() }),
+      });
+      if (!res.ok) throw new Error(`SSE 失败 (${res.status})`);
+      const runId = res.headers.get("X-Run-Id");
+      if (runId) document.getElementById("opsRunId").textContent = runId;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop();
+        for (const frame of frames) {
+          const eventName = (frame.split("\n").find((l) => l.startsWith("event:")) || "event: message").slice(6).trim();
+          pre.textContent += `▸ ${eventName}\n`;
+          pre.scrollTop = pre.scrollHeight;
+        }
+      }
+      pre.textContent += "\n── 流结束 ──";
+    } catch (err) {
+      pre.textContent = describeError(err);
+    }
+  };
+
+  const extra = (title, obj) => {
+    document.getElementById("opsExtra").innerHTML = `<div class="section" style="margin-top:16px;"><h3 style="margin-bottom:8px;">${esc(title)}</h3>${jsonBlock("原始响应", obj)}</div>`;
+  };
+  document.getElementById("btnBenchmark").onclick = async () => {
+    try { extra("并行基准测试", await call("/v1/ops/parallel/benchmark", { method: "POST", body: { count: 4, sleep_s: 0.05, fail_every: 0 } }, "ops:rw")); }
+    catch (err) { toast(describeError(err), "err"); }
+  };
+  document.getElementById("btnSelfEvolve").onclick = async () => {
+    try { extra("自进化报告", await call("/v1/ops/selfevolve/report", {}, "ops:rw")); }
+    catch (err) { toast(describeError(err), "err"); }
+  };
+  document.getElementById("btnAnalytics").onclick = async () => {
+    const body = { channels: [{ channel: "social", metric_key: "cvr", delta: 0.12 }, { channel: "search", metric_key: "cvr", delta: -0.04 }], materials: [], market: "US" };
+    try { extra("归因分析", await call("/v1/ops/analytics/report", { method: "POST", body }, "ops:rw")); }
+    catch (err) { toast(describeError(err), "err"); }
+  };
+  document.getElementById("btnAssetSearch").onclick = async () => {
+    const q = document.getElementById("assetQuery").value.trim();
+    try { extra("跨模态检索命中", await call(`/v1/ops/assets/search?query=${encodeURIComponent(q)}`, {}, "ops:rw")); }
+    catch (err) { toast(describeError(err), "err"); }
+  };
+};
+
+// ============================================================================
+// AI 成本与治理
+// ============================================================================
+RENDERERS.cost = async function () {
+  const el = document.getElementById("tab-cost");
+  el.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+  try {
+    const [cost, quota, audit, prompts] = await Promise.all([
+      call("/v1/cost"), call("/v1/quota"), call("/v1/audit?limit=20"), call("/v1/prompts"),
+    ]);
+    const metering = Object.entries(cost.metering || {});
+    el.innerHTML = `
+      <div class="grid p4 section">
+        <div class="kpi"><div class="label">本服务累计调用</div><div class="value">${fmt.num(cost.totals.calls)}</div></div>
+        <div class="kpi"><div class="label">累计 Token</div><div class="value">${fmt.num(cost.totals.total_tokens)}</div></div>
+        <div class="kpi"><div class="label">累计成本</div><div class="value">${fmt.usd6(cost.totals.cost_usd)}</div></div>
+        <div class="kpi"><div class="label">预算水位</div><div class="value">${((cost.budget.ratio || 0) * 100).toFixed(1)}<small>%</small></div></div>
+      </div>
+      <div class="section">
+        <div class="row between" style="margin-bottom:6px;"><span class="tag">预算：${fmt.num(cost.budget.used_tokens)} / ${fmt.num(cost.budget.limit_tokens)} tokens（${esc(cost.budget.scope)}）</span><span class="tag">后端 ${esc(cost.backends.budget)}</span></div>
+        <div class="bar"><i style="width:${Math.min(100, (cost.budget.ratio || 0) * 100)}%"></i></div>
+      </div>
+      <div class="grid p2 section">
+        <div class="card">
+          <div class="card-head"><h3>按 Service / Agent 计量</h3><span class="tag">/v1/cost</span></div>
+          <div class="card-body">
+            ${metering.length ? `<table class="table"><thead><tr><th>Service/Agent</th><th>调用</th><th>Token</th><th>成本</th><th>均延迟</th></tr></thead><tbody>
+              ${metering.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td>${v.calls}</td><td>${fmt.num(v.total_tokens)}</td><td>${fmt.usd6(v.cost_usd)}</td><td class="tag">${Math.round(v.avg_latency_ms || 0)}ms</td></tr>`).join("")}
+            </tbody></table>` : `<div class="empty">当前凭证的 service 前缀下没有调用记录（成本按业务线隔离）。</div>`}
+            ${jsonBlock("原始响应（/v1/cost）", cost)}
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>配额用量</h3><span class="tag">/v1/quota</span></div>
+          <div class="card-body col">
+            <div class="kv-list">
+              <dt>项目</dt><dd class="mono">${esc(quota.project_id)}</dd>
+              <dt>窗口内请求</dt><dd>${fmt.num(quota.requests)} / ${fmt.num(quota.limits.requests_per_window)}</dd>
+              <dt>窗口内 Token</dt><dd>${fmt.num(quota.tokens)} / ${fmt.num(quota.limits.tokens_per_window)}</dd>
+              <dt>窗口</dt><dd>${quota.limits.window_s}s · 后端 ${esc(quota.backend)}</dd>
+            </div>
+            <div class="bar"><i style="width:${Math.min(100, (quota.requests / Math.max(1, quota.limits.requests_per_window)) * 100)}%"></i></div>
+            <div class="row"><button class="btn sm" id="btnEval">跑一次评测</button><span class="tag">POST /v1/eval/run（scope: eval:rw）</span></div>
+            <div id="evalResult"></div>
+          </div>
+        </div>
+      </div>
+      <div class="card section">
+        <div class="card-head"><h3>审计链</h3><span class="tag">Service → Agent → Tool → Resource（按项目隔离）</span></div>
+        <div class="card-body">
+          <table class="table"><thead><tr><th>时间</th><th>决策</th><th>服务</th><th>Agent</th><th>工具</th><th>资源</th></tr></thead><tbody>
+            ${(audit.entries || []).map((e) => `<tr>
+              <td class="tag">${fmt.time(e.ts || e.created_at)}</td>
+              <td><span class="badge ${e.decision === "allow" ? "ok" : e.decision === "deny" ? "err" : "warn"}">${esc(e.decision)}</span></td>
+              <td class="mono">${esc(e.service || "—")}</td>
+              <td>${esc(e.agent || "—")}</td>
+              <td>${esc(e.tool || "—")}</td>
+              <td class="mono">${esc(e.resource || "—")}</td>
+            </tr>`).join("") || `<tr><td colspan="6" class="empty">暂无审计记录（先在上面的面板触发一次调用）</td></tr>`}
+          </tbody></table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Prompt 模板中心</h3><span class="tag">版本化 · 不含正文</span></div>
+        <div class="card-body">
+          ${(prompts.roles || []).map((r) => `<div class="panel row between" style="margin-bottom:8px;">
+            <div><div style="font-weight:600;">${esc(r.title)} <span class="tag mono">${esc(r.role)}</span></div>
+              <div class="tag">场景：${(r.scenarios || []).join(" / ") || "—"} · 层：${(r.layers || []).join(" → ")}</div></div>
+          </div>`).join("") || `<div class="empty">无模板</div>`}
+          ${jsonBlock("原始响应（/v1/prompts）", prompts)}
+        </div>
+      </div>`;
+
+    document.getElementById("btnEval").onclick = async () => {
+      const box = document.getElementById("evalResult");
+      box.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+      try {
+        const res = await call("/v1/eval/run", { method: "POST", body: {} }, "eval:rw");
+        box.innerHTML = `<div class="section" style="margin-top:12px;">${jsonBlock("评测结果", res)}</div>`;
+      } catch (err) { box.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`; }
+    };
+  } catch (err) {
+    el.innerHTML = `<div class="empty">${esc(describeError(err))}</div>`;
+  }
+};
+
+// ============================================================================
+// 凭证与权限（现场演示 401 / 403 / 200）
+// ============================================================================
+RENDERERS.auth = async function () {
+  const el = document.getElementById("tab-auth");
+  el.innerHTML = `
+    <div class="card section">
+      <div class="card-head"><h3>三态凭证矩阵</h3><span class="tag">同一接口 × 三种凭证</span></div>
+      <div class="card-body col">
+        <p class="muted" style="font-size:13px;">
+          后端的权限面是「前缀 + scope」两层：<b>/v1/admin/*</b> 要 <b>commerce:rw</b>，
+          <b>/v1/ops/*</b> 要 <b>ops:rw</b>，平台治理接口只要「任意有效凭证」。
+          下面用同一个 <b>/v1/admin/orders/stats</b> 分别打三种凭证，结果应当是 401 → 403 → 200。
+        </p>
+        <div class="field" style="max-width:420px;"><label>探针接口</label><input class="input" id="probePath" value="/v1/admin/orders/stats" /></div>
+        <button class="btn primary" id="btnProbe" style="align-self:flex-start;">依次打三种凭证</button>
+        <div id="probeResult" style="margin-top:14px;"><div class="empty">尚未探测。</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>演示凭证清单</h3><span class="tag">来自 config/models.yaml（演示用明文）</span></div>
+      <div class="card-body">
+        <table class="table"><thead><tr><th>凭证</th><th>项目 / 服务</th><th>scopes</th><th></th></tr></thead><tbody>
+          ${KEYS.filter((k) => k.id).map((k) => `<tr>
+            <td class="mono" style="font-size:11px;">${esc(k.id)}</td>
+            <td>${esc(k.label)}</td>
+            <td class="row wrap-row" style="gap:4px;">${k.scopes.map((s) => `<span class="badge brand">${esc(s)}</span>`).join("")}</td>
+            <td><button class="btn sm" data-use="${esc(k.id)}">用这把</button></td>
+          </tr>`).join("")}
+        </tbody></table>
+        <div class="tag" style="margin-top:10px;">诚实边界：演示页把明文 API Key 放在浏览器里，只为省掉一个 BFF；
+          真实系统里运营台凭证必须由服务端会话持有，前端永远拿不到明文 key。</div>
+      </div>
+    </div>`;
+
+  el.querySelectorAll("[data-use]").forEach((b) => (b.onclick = () => { Store.adminKey.set(b.dataset.use); initKeySelect(); toast("已切换凭证，重新查看各面板", "ok"); }));
+  document.getElementById("btnProbe").onclick = async () => {
+    const path = document.getElementById("probePath").value.trim();
+    const box = document.getElementById("probeResult");
+    const cases = [
+      { label: "无凭证", key: "" },
+      { label: "客服线凭证（应 403：缺 commerce:rw）", key: "sk-project-service-demo" },
+      { label: "运营后台凭证（应 200）", key: "sk-project-shopadmin-demo" },
+    ];
+    box.innerHTML = `<div class="col">` + cases.map((c) => `<div class="panel row between" data-case="${esc(c.label)}"><span>${esc(c.label)}</span><span class="spinner"></span></div>`).join("") + `</div>`;
+    for (const c of cases) {
+      const row = box.querySelector(`[data-case="${c.label}"]`);
+      try {
+        const res = await api(path, { key: c.key, token: "" });
+        row.querySelector("span:last-child").outerHTML = `<span class="badge ok">200 · 通过</span>`;
+        row.insertAdjacentHTML("beforeend", jsonBlock("响应", res));
+      } catch (err) {
+        row.querySelector("span:last-child").outerHTML = `<span class="badge err">${err.status} · ${esc(describeError(err))}</span>`;
+        if (err.envelope) row.insertAdjacentHTML("beforeend", jsonBlock("错误信封", err.envelope));
+      }
+    }
+  };
+};
+
+// ---------- 凭证选择器 ----------
+function initKeySelect() {
+  const sel = document.getElementById("keySelect");
+  sel.innerHTML = KEYS.map((k) => `<option value="${esc(k.id)}" ${k.id === Store.adminKey.get() ? "selected" : ""}>${esc(k.label)}</option>`).join("");
+  renderScopes();
+}
+function renderScopes() {
+  const k = currentKey();
+  document.getElementById("scopeList").innerHTML = k.scopes.length
+    ? k.scopes.map((s) => `<span class="badge brand">${esc(s)}</span>`).join("")
+    : `<span class="badge err">匿名</span>`;
+}
+
+if (!Store.adminKey.get()) Store.adminKey.set("sk-project-shopadmin-demo");
+initKeySelect();
+document.getElementById("keySelect").onchange = (e) => { Store.adminKey.set(e.target.value); renderScopes(); showTab(document.querySelector(".nav-item.active").dataset.tab); };
+showTab("overview");
+</script>
+</body>
+</html>
